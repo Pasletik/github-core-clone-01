@@ -22,6 +22,11 @@ import time
 import urllib.error
 import urllib.request
 
+# The server launches this file as `python3 -P -s /bot/main.py`: -P keeps the
+# script's directory off sys.path, so add it back or the forge imports below
+# raise ModuleNotFoundError and the process exits before binding any port.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from forge.server import serve
 from forge.store import Store
 

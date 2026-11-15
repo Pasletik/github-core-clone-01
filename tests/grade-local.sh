@@ -41,9 +41,11 @@ if [ ! -f "$STATE/ready" ]; then
 fi
 cat "$STATE/ready"
 echo "[grade] env ready; starting forge ..."
+# Launch exactly as the server does (`python3 -P -s /bot/main.py`): -P keeps the
+# script's directory off sys.path, so main.py must add it back itself.
 MAKEFUN_ENV_URL="$ENV_URL" MAKEFUN_SHOP_TOKEN="$TOKEN" \
   MAKEFUN_TRIAL_NOW=1735689600 \
-  python3 main.py > "$BASE/forge.log" 2>&1 &
+  python3 -P -s main.py > "$BASE/forge.log" 2>&1 &
 FORGE_PID=$!
 echo "[grade] forge pid $FORGE_PID"
 
