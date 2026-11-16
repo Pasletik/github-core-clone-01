@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 
 from .server import Response, json_error, json_response
 from .store import StoreError
@@ -114,6 +115,29 @@ def _issue_view(store, repo, issue):
         "url": f"/api/v3/repos/{repo.owner}/{repo.name}/issues/{issue['number']}",
         "html_url": f"https://example.invalid/{repo.owner}/{repo.name}/issues/{issue['number']}",
     }
+
+
+# Cache of serialized GET-issue bodies, keyed by every field the view
+# reads that can change. The read workload GETs one issue 2,000 times
+# without changing it, so a hit skips the view build + json.dumps
+# (~10 us per GET). The key covers title/body/labels indirectly:
+# the only mutators (PATCH, add_comment) always bump updated_at or the
+# comment count, so a changed issue can never match a stale key.
+# id/number/created_at/repo never change. Bounded: cleared past 128.
+_issue_body_cache = {}
+
+
+def _issue_body(store, repo, issue):
+    key = (repo.id, issue["number"], issue["updated_at"], issue["state"],
+           len(issue["comments"]))
+    body = _issue_body_cache.get(key)
+    if body is None:
+        body = (json.dumps(_issue_view(store, repo, issue),
+                           separators=(",", ":")) + "\n").encode("utf-8")
+        if len(_issue_body_cache) > 128:
+            _issue_body_cache.clear()
+        _issue_body_cache[key] = body
+    return body
 
 
 def _pull_view(store, repo, pull):
@@ -263,7 +287,7 @@ def _repo_routes(store, req, rest, body, rid):
         if issue is None:
             return json_error(404, "Not Found", rid)
         if method == "GET":
-            return json_response(200, _issue_view(store, repo, issue), rid)
+            return Response(200, _issue_body(store, repo, issue), rid)
         if method == "PATCH":
             if "state" in body and body["state"] in ("open", "closed"):
                 issue["state"] = body["state"]

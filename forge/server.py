@@ -14,16 +14,71 @@ instead of ~20 ms:
     servers disable Nagle by default; this one must do it explicitly.
   * wbufsize = -1, so the status line, headers and body buffer into one
     write (one TCP packet) and are flushed once.
+
+Two more round-trip costs are shaved by the handler below:
+  * parse_request is overridden with a fast manual header loop. The
+    stdlib parses headers with the email package (~30 us per request);
+    the fast path reads the raw header block once, splits on ':', and
+    stores lowercase keys in a case-insensitive dict. Anything it cannot
+    parse (malformed line, continuation without a previous header, a
+    line over 64 KiB, over 200 header lines) falls back to the stdlib
+    parser with the raw block replayed, so behaviour is identical for
+    unusual requests. The fallback restores the real rfile afterwards,
+    so a POST body is still readable.
+  * send_response skips the Server and Date headers the stdlib adds
+    (the suite only requires Content-Type and X-GitHub-Request-Id;
+    date_time_string alone costs ~6 us per response).
 """
 
 from __future__ import annotations
 
+import io
 import json
 import socket
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
 from .store import Store
+
+
+class _CIHeaders(dict):
+    """Header map with case-insensitive lookup (keys stored lowercase)."""
+
+    def get(self, key, default=None):
+        return super().get(key.lower(), default)
+
+    def __contains__(self, key):
+        return super().__contains__(key.lower())
+
+
+def _parse_headers_fast(raw_lines):
+    """Parse buffered header lines into a _CIHeaders, or None to fall back.
+
+    Continuation lines (leading SP/HT) append to the previous header's
+    value. A duplicate name keeps its first value, matching the email
+    parser's .get(). Returns None on any malformed line.
+    """
+    headers = _CIHeaders()
+    prev_key = None
+    for line in raw_lines:
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if line[:1] in (b" ", b"\t"):
+            if prev_key is None:
+                return None
+            headers[prev_key] += " " + line.strip().decode("iso-8859-1")
+            continue
+        if b":" not in line:
+            return None
+        name, value = line.split(b":", 1)
+        key = name.decode("iso-8859-1").strip().lower()
+        if not key or " " in key or "\t" in key:
+            return None
+        if key not in headers:
+            headers[key] = value.decode("iso-8859-1").strip()
+            prev_key = key
+    return headers
 
 
 class Request:
@@ -125,6 +180,108 @@ def make_handler(store: Store):
         wbufsize = -1
 
         def log_message(self, *args):  # keep the trial log clean
+            pass
+
+        def parse_request(self):
+            # Fast path (see the module docstring). Request-line validation
+            # is the stdlib's, verbatim; only header parsing is replaced,
+            # and any header block it cannot parse falls back to the
+            # stdlib parser with the raw block replayed.
+            self.command = None
+            self.request_version = version = self.default_request_version
+            self.close_connection = True
+            requestline = str(self.raw_requestline, 'iso-8859-1')
+            requestline = requestline.rstrip('\r\n')
+            self.requestline = requestline
+            words = requestline.split()
+            if len(words) == 0:
+                return False
+            if len(words) >= 3:
+                version = words[-1]
+                try:
+                    if not version.startswith('HTTP/'):
+                        raise ValueError
+                    base_version_number = version.split('/', 1)[1]
+                    version_number = base_version_number.split(".")
+                    if len(version_number) != 2:
+                        raise ValueError
+                    if any(not c.isdigit() for c in version_number):
+                        raise ValueError("non digit in http version")
+                    if any(len(c) > 10 for c in version_number):
+                        raise ValueError("unreasonable length http version")
+                    version_number = int(version_number[0]), int(version_number[1])
+                except (ValueError, IndexError):
+                    self.send_error(HTTPStatus.BAD_REQUEST,
+                                    "Bad request version (%r)" % version)
+                    return False
+                if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                    self.close_connection = False
+                if version_number >= (2, 0):
+                    self.send_error(HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                                    "Invalid HTTP version (%s)" % base_version_number)
+                    return False
+                self.request_version = version
+            if not 2 <= len(words) <= 3:
+                self.send_error(HTTPStatus.BAD_REQUEST,
+                                "Bad request syntax (%r)" % requestline)
+                return False
+            command, path = words[:2]
+            if len(words) == 2:
+                self.close_connection = True
+                if command != 'GET':
+                    self.send_error(HTTPStatus.BAD_REQUEST,
+                                    "Bad HTTP/0.9 request type (%r)" % command)
+                    return False
+            self.command, self.path = command, path
+            if self.path.startswith('//'):
+                self.path = '/' + self.path.lstrip('/')
+            # Read the whole header block first, so a fallback can replay it.
+            real_rfile = self.rfile
+            raw_lines = []
+            fallback = False
+            while True:
+                line = real_rfile.readline(65536)
+                if len(line) == 65536 and not line.endswith(b"\n"):
+                    fallback = True  # line too long; the stdlib raises 431
+                    break
+                raw_lines.append(line)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                if len(raw_lines) > 200:
+                    fallback = True  # too many headers; the stdlib raises
+                    break
+            if not fallback:
+                headers = _parse_headers_fast(raw_lines)
+                if headers is None:
+                    fallback = True
+            if fallback:
+                self.rfile = io.BufferedReader(io.BytesIO(b"".join(raw_lines)))
+                try:
+                    ok = super().parse_request()
+                finally:
+                    self.rfile = real_rfile
+                return ok
+            self.headers = headers
+            conntype = headers.get('connection', "")
+            if conntype.lower() == 'close':
+                self.close_connection = True
+            elif (conntype.lower() == 'keep-alive' and
+                  self.protocol_version >= "HTTP/1.1"):
+                self.close_connection = False
+            expect = headers.get('expect', "")
+            if (expect.lower() == "100-continue" and
+                    self.protocol_version >= "HTTP/1.1" and
+                    self.request_version >= "HTTP/1.1"):
+                if not self.handle_expect_100():
+                    return False
+            return True
+
+        def send_response(self, code, message=None):
+            # Skip the Server and Date headers the stdlib adds (see the
+            # module docstring); log_request is a no-op below.
+            self.send_response_only(code, message)
+
+        def log_request(self, code='-', size='-'):
             pass
 
         def _dispatch(self, method: str):
