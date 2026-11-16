@@ -58,7 +58,7 @@ class Repo:
     __slots__ = (
         "id", "owner", "name", "private", "description", "default_branch",
         "objects", "refs", "issues", "pulls", "labels", "next_issue_number",
-        "next_pull_number", "created_at", "updated_at",
+        "next_pull_number", "created_at", "updated_at", "verified",
     )
 
     def __init__(self, repo_id: int, owner: str, name: str, private: bool,
@@ -78,6 +78,10 @@ class Repo:
         self.next_pull_number = 1
         self.created_at = created_at
         self.updated_at = created_at
+        # Oids whose full closure is known present in objects (see
+        # gitproto._verify_push). Objects are never removed, so once an
+        # oid is verified it stays verified for the repo's life.
+        self.verified = set()
 
     @property
     def full_name(self) -> str:

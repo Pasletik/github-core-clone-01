@@ -428,6 +428,78 @@ def _receive_pack(store, repo, req) -> Response:
     return Response(200, bytes(out), content_type=ctype)
 
 
+def _commit_head(data: bytes):
+    """(tree_oid, [parent oids]) from a commit's header block, without a
+    full parse: only the header lines are scanned."""
+    tree = None
+    parents = []
+    header = data.split(b"\n\n", 1)[0]
+    for line in header.split(b"\n"):
+        if line.startswith(b"tree "):
+            tree = line[5:].decode("ascii").strip()
+        elif line.startswith(b"parent "):
+            parents.append(line[7:].decode("ascii").strip())
+    return tree, parents
+
+
+def _tag_target(data: bytes):
+    """Target oid of a tag object, or None."""
+    header = data.split(b"\n\n", 1)[0]
+    for line in header.split(b"\n"):
+        if line.startswith(b"object "):
+            return line[7:].decode("ascii").strip()
+    return None
+
+
+def _verify_push(repo, old_tip, new_tip):
+    """Verify a push's new tip before the ref moves.
+
+    Two checks, one walk: every object reachable from new_tip must be
+    present in the store, and (for an update) new_tip must descend from
+    old_tip. Objects already in repo.verified are known closed, so a
+    fast-forward push only walks the new commits — never the whole
+    history. Returns (ok, reason) with reason '' / 'missing objects' /
+    'non-fast-forward'; on success the newly verified oids join
+    repo.verified.
+    """
+    verified = repo.verified
+    newly = set()
+    seen = set()
+    stack = [new_tip]
+    reached_old = old_tip is None
+    while stack:
+        oid = stack.pop()
+        if oid in seen or oid == ZERO_OID:
+            continue
+        seen.add(oid)
+        if oid == old_tip:
+            reached_old = True
+        if oid in verified:
+            continue
+        found = repo.lookup(oid)
+        if found is None:
+            return False, "missing objects"
+        obj_type, data = found
+        newly.add(oid)
+        if obj_type == "commit":
+            tree, parents = _commit_head(data)
+            if tree is not None:
+                stack.append(tree)
+            stack.extend(parents)
+        elif obj_type == "tag":
+            target = _tag_target(data)
+            if target is not None:
+                stack.append(target)
+        elif obj_type == "tree":
+            for _mode, _name, child in gitobjs.parse_tree(data):
+                stack.append(child)
+        # blobs are leaves
+    if not reached_old:
+        return False, "non-fast-forward"
+    verified.update(newly)
+    return True, ""
+
+
 def _apply_command(repo, old_oid, new_oid, ref, unpack_ok):
     if not unpack_ok:
         return False, "unpacker error"
@@ -449,8 +521,9 @@ def _apply_command(repo, old_oid, new_oid, ref, unpack_ok):
         # create
         if current is not None:
             return False, "already exists"
-        if not _closure_present(repo, new_oid):
-            return False, "missing objects"
+        ok, reason = _verify_push(repo, None, new_oid)
+        if not ok:
+            return False, reason
         repo.refs[ref] = new_oid
         return True, ""
     # update
@@ -460,17 +533,8 @@ def _apply_command(repo, old_oid, new_oid, ref, unpack_ok):
         return False, "stale old value"
     if new_oid == current:
         return True, ""
-    if not _closure_present(repo, new_oid):
-        return False, "missing objects"
-    if not _is_descendant(repo, current, new_oid):
-        return False, "non-fast-forward"
+    ok, reason = _verify_push(repo, current, new_oid)
+    if not ok:
+        return False, reason
     repo.refs[ref] = new_oid
     return True, ""
-
-
-def _closure_present(repo, oid) -> bool:
-    try:
-        gitobjs.collect_reachable(repo.lookup, [oid])
-        return True
-    except KeyError:
-        return False
